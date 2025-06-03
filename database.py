@@ -13,7 +13,7 @@ DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
-DB_PORT = os.getenv("DB_PORT")  # Default MySQL port
+DB_PORT = os.getenv("DB_PORT")  # Default MySQL port (3306)
 
 # MySQL connection string with explicit port
 SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
