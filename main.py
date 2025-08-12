@@ -1,186 +1,579 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from sqlalchemy.exc import IntegrityError
+from typing import List, Optional
+from datetime import datetime
 import models
+from models import Base
 from database import engine, get_db, check_db_connection
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field, validator
 from security import get_password_hash, verify_password
 
 # Create database tables
-models.Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+app = FastAPI(
+    title="Product & User Management API with Categories",
+    description="API for managing users, categories, and products with validation and database migrations",
+    version="2.0.0"
+)
 
 # Check database connection on startup
 @app.on_event("startup")
 async def startup_event():
     print("\nChecking database connection...")
     if not check_db_connection():
-        print("Application will continue, but database operations may fail.")
+        print("Application will continue running, but database operations may fail.")
     print("\nStarting FastAPI application...")
 
 # Root endpoint with welcome message
 @app.get("/")
 async def root():
-    return {"message": "Welcome to FastAPI"}
+    return {
+        "message": "Welcome to Product & User Management API with Categories", 
+        "docs": "Visit /docs for API documentation",
+        "version": "2.0.0",
+        "endpoints": {
+            "users": "/users/",
+            "categories": "/categories/",
+            "products": "/products/"
+        }
+    }
 
-# Pydantic models for request/response
+# Enhanced Pydantic models for User with validation
 class UserBase(BaseModel):
-    name: str
-    email: str
+    name: str = Field(..., min_length=1, max_length=50, description="Full name (1-50 characters)")
+    email: EmailStr = Field(..., description="Valid and unique email address")
 
 class UserCreate(UserBase):
-    password: str
+    password: str = Field(..., min_length=8, max_length=100, description="Password minimum 8 characters")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if not v.strip():
+            raise ValueError('Name cannot be empty')
+        if any(char.isdigit() for char in v):
+            raise ValueError('Name cannot contain numbers')
+        return v.strip()
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain at least 1 digit')
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain at least 1 uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain at least 1 lowercase letter')
+        return v
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=50, description="Full name")
+    email: Optional[EmailStr] = Field(None, description="Valid email address")
+    password: Optional[str] = Field(None, min_length=8, max_length=100, description="New password")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if v is not None:
+            if not v.strip():
+                raise ValueError('Name cannot be empty')
+            if any(char.isdigit() for char in v):
+                raise ValueError('Name cannot contain numbers')
+            return v.strip()
+        return v
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if v is not None:
+            if len(v) < 8:
+                raise ValueError('Password must be at least 8 characters')
+            if not any(c.isdigit() for c in v):
+                raise ValueError('Password must contain at least 1 digit')
+            if not any(c.isupper() for c in v):
+                raise ValueError('Password must contain at least 1 uppercase letter')
+            if not any(c.islower() for c in v):
+                raise ValueError('Password must contain at least 1 lowercase letter')
+        return v
 
 class User(UserBase):
     id: int
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
 
-#class productBase(BaseModel):
+# Enhanced Pydantic models for Category with validation
+class CategoryBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Category name (1-100 characters)")
+    description: Optional[str] = Field(None, max_length=255, description="Category description (optional)")
+
+class CategoryCreate(CategoryBase):
+    user_id: int = Field(..., gt=0, description="Category owner user ID")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if not v.strip():
+            raise ValueError('Category name cannot be empty')
+        return v.strip()
+    
+    @validator('description')
+    def validate_description(cls, v):
+        if v is not None and v.strip():
+            return v.strip()
+        return v
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100, description="Category name")
+    description: Optional[str] = Field(None, max_length=255, description="Category description")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if v is not None:
+            if not v.strip():
+                raise ValueError('Category name cannot be empty')
+            return v.strip()
+        return v
+    
+    @validator('description')
+    def validate_description(cls, v):
+        if v is not None and v.strip():
+            return v.strip()
+        return v
+
+class Category(CategoryBase):
+    id: int
+    user_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# Enhanced Pydantic models for Product with validation
 class ProductBase(BaseModel):
-    name: str
-    price: float
-    stock: int
+    name: str = Field(..., min_length=1, max_length=100, description="Product name (1-100 characters)")
+    stock: int = Field(..., ge=0, description="Product stock (must be >= 0)")
+    price: float = Field(..., gt=0, description="Product price (must be > 0)")
 
 class ProductCreate(ProductBase):
-    pass
+    category_id: int = Field(..., gt=0, description="Product category ID")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if not v.strip():
+            raise ValueError('Product name cannot be empty')
+        return v.strip()
+    
+    @validator('stock')
+    def validate_stock(cls, v):
+        if v < 0:
+            raise ValueError('Stock cannot be negative')
+        if v > 999999:
+            raise ValueError('Stock maximum is 999999')
+        return v
+    
+    @validator('price')
+    def validate_price(cls, v):
+        if v <= 0:
+            raise ValueError('Price must be greater than 0')
+        if v > 999999999:
+            raise ValueError('Price maximum is 999999999')
+        return round(v, 2)
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100, description="Product name")
+    stock: Optional[int] = Field(None, ge=0, description="Product stock")
+    price: Optional[float] = Field(None, gt=0, description="Product price")
+    category_id: Optional[int] = Field(None, gt=0, description="Product category ID")
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if v is not None:
+            if not v.strip():
+                raise ValueError('Product name cannot be empty')
+            return v.strip()
+        return v
+    
+    @validator('stock')
+    def validate_stock(cls, v):
+        if v is not None:
+            if v < 0:
+                raise ValueError('Stock cannot be negative')
+            if v > 999999:
+                raise ValueError('Stock maximum is 999999')
+        return v
+    
+    @validator('price')
+    def validate_price(cls, v):
+        if v is not None:
+            if v <= 0:
+                raise ValueError('Price must be greater than 0')
+            if v > 999999999:
+                raise ValueError('Price maximum is 999999999')
+            return round(v, 2)
+        return v
+
 class Product(ProductBase):
     id: int
+    category_id: int
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
 
-
-
-# Create user
-@app.post("/user/", response_model=User)
+# USER API ENDPOINTS
+@app.post("/user/", response_model=User, status_code=status.HTTP_201_CREATED)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    # Hash the password before storing
-    hashed_password = get_password_hash(user.password)
+    """Create a new user with complete data validation"""
+    try:
+        # Check if email already exists
+        existing_user = db.query(models.User).filter(models.User.email == user.email).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Hash password before saving
+        hashed_password = get_password_hash(user.password)
+        
+        # Create new user
+        db_user = models.User(
+            name=user.name,
+            email=user.email,
+            password=hashed_password
+        )
+        
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
     
-    # Create user with hashed password
-    db_user = models.User(
-        name=user.name,
-        email=user.email,
-        password=hashed_password
-    )
-    
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
 
-# Get all users
 @app.get("/users/", response_model=List[User])
 def read_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get all users with pagination"""
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
     users = db.query(models.User).offset(skip).limit(limit).all()
     return users
 
-# Get user by id
 @app.get("/user/{user_id}", response_model=User)
 def read_user(user_id: int, db: Session = Depends(get_db)):
+    """Get user by ID"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
     if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return db_user
 
-# Update user
 @app.put("/user/{user_id}", response_model=User)
-def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
+def update_user(user_id: int, user: UserUpdate, db: Session = Depends(get_db)):
+    """Update user information"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
     if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     
-    # Hash the new password if it's provided
-    if user.password:
-        hashed_password = get_password_hash(user.password)
-        db_user.password = hashed_password
+    try:
+        # Update only provided fields
+        if user.name is not None:
+            db_user.name = user.name
+        if user.email is not None:
+            # Check if email already exists
+            existing_user = db.query(models.User).filter(
+                models.User.email == user.email,
+                models.User.id != user_id
+            ).first()
+            if existing_user:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already used by another user"
+                )
+            db_user.email = user.email
+        if user.password is not None:
+            hashed_password = get_password_hash(user.password)
+            db_user.password = hashed_password
+        
+        db.commit()
+        db.refresh(db_user)
+        return db_user
     
-    db_user.name = user.name
-    db_user.email = user.email
-    
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already used by another user"
+        )
 
-# Delete user
-@app.delete("/user/{user_id}")
+@app.delete("/user/{user_id}", status_code=status.HTTP_200_OK)
 def delete_user(user_id: int, db: Session = Depends(get_db)):
+    """Delete user"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
     if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     
     db.delete(db_user)
     db.commit()
-    return {"message": "User deleted successfully"}
+    return {"message": f"User with ID {user_id} successfully deleted"}
 
-# Verify password endpoint
 @app.post("/user/verify-password/{user_id}")
 def verify_user_password(user_id: int, password: str, db: Session = Depends(get_db)):
+    """Verify user password"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    if not password or len(password.strip()) == 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password cannot be empty")
+    
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
     if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     
     if verify_password(password, db_user.password):
         return {"message": "Password is correct"}
     else:
-        raise HTTPException(status_code=401, detail="Incorrect password")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Password is incorrect") 
 
-# Create product
-@app.post("/product/", response_model=Product)
+# CATEGORY API ENDPOINTS
+@app.post("/category/", response_model=Category, status_code=status.HTTP_201_CREATED)
+def create_category(category: CategoryCreate, db: Session = Depends(get_db)):
+    """Create a new category with complete data validation"""
+    # Check if user_id is valid
+    user_exists = db.query(models.User).filter(models.User.id == category.user_id).first()
+    if not user_exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User ID not found"
+        )
+    
+    db_category = models.Category(
+        name=category.name,
+        description=category.description,
+        user_id=category.user_id
+    )
+    
+    db.add(db_category)
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+@app.get("/categories/", response_model=List[Category])
+def read_categories(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get all categories with pagination"""
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
+    categories = db.query(models.Category).offset(skip).limit(limit).all()
+    return categories
+
+@app.get("/categories/user/{user_id}", response_model=List[Category])
+def read_categories_by_user(user_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get categories by user ID"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
+    categories = db.query(models.Category).filter(models.Category.user_id == user_id).offset(skip).limit(limit).all()
+    return categories
+
+@app.get("/category/{category_id}", response_model=Category)
+def read_category(category_id: int, db: Session = Depends(get_db)):
+    """Get category by ID"""
+    if category_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category ID must be > 0")
+    
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    if db_category is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+    return db_category
+
+@app.put("/category/{category_id}", response_model=Category)
+def update_category(category_id: int, category: CategoryUpdate, db: Session = Depends(get_db)):
+    """Update category information"""
+    if category_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category ID must be > 0")
+    
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    if db_category is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+    
+    # Update only provided fields
+    if category.name is not None:
+        db_category.name = category.name
+    if category.description is not None:
+        db_category.description = category.description
+    
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+@app.delete("/category/{category_id}", status_code=status.HTTP_200_OK)
+def delete_category(category_id: int, db: Session = Depends(get_db)):
+    """Delete category"""
+    if category_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category ID must be > 0")
+    
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    if db_category is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+    
+    # Check if there are products using this category
+    products_count = db.query(models.Product).filter(models.Product.category_id == category_id).count()
+    if products_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete category. There are {products_count} products using this category."
+        )
+    
+    db.delete(db_category)
+    db.commit()
+    return {"message": f"Category with ID {category_id} successfully deleted"}
+
+# PRODUCT API ENDPOINTS
+@app.post("/product/", response_model=Product, status_code=status.HTTP_201_CREATED)
 def create_product(product: ProductCreate, db: Session = Depends(get_db)):
+    """Create a new product with complete data validation"""
+    # Check if category_id is valid
+    category_exists = db.query(models.Category).filter(models.Category.id == product.category_id).first()
+    if not category_exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Category ID not found"
+        )
+    
     db_product = models.Product(
         name=product.name,
+        stock=product.stock,
         price=product.price,
-        stock=product.stock
+        category_id=product.category_id
     )
     
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
     return db_product
-    
-#get all products
+
 @app.get("/products/", response_model=List[Product])
 def read_products(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get all products with pagination"""
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
     products = db.query(models.Product).offset(skip).limit(limit).all()
     return products
 
-#get product by id
+@app.get("/products/category/{category_id}", response_model=List[Product])
+def read_products_by_category(category_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get products by category"""
+    if category_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category ID must be > 0")
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
+    products = db.query(models.Product).filter(models.Product.category_id == category_id).offset(skip).limit(limit).all()
+    return products
+
 @app.get("/product/{product_id}", response_model=Product)
 def read_product(product_id: int, db: Session = Depends(get_db)):
+    """Get product by ID"""
+    if product_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Product ID must be > 0")
+    
     db_product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if db_product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return db_product
 
-
-# Update product
 @app.put("/product/{product_id}", response_model=Product)
-def update_product(product_id: int, product: ProductCreate, db: Session = Depends(get_db)):
+def update_product(product_id: int, product: ProductUpdate, db: Session = Depends(get_db)):
+    """Update product information"""
+    if product_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Product ID must be > 0")
+    
     db_product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if db_product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     
-    db_product.name = product.name
-    db_product.price = product.price
-    db_product.stock = product.stock
+    # If category_id is updated, check its validity
+    if product.category_id is not None:
+        category_exists = db.query(models.Category).filter(models.Category.id == product.category_id).first()
+        if not category_exists:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Category ID not found"
+            )
+    
+    # Update only provided fields
+    if product.name is not None:
+        db_product.name = product.name
+    if product.stock is not None:
+        db_product.stock = product.stock
+    if product.price is not None:
+        db_product.price = product.price
+    if product.category_id is not None:
+        db_product.category_id = product.category_id
     
     db.commit()
     db.refresh(db_product)
     return db_product
 
-
-# Delete product
-@app.delete("/product/{product_id}")
+@app.delete("/product/{product_id}", status_code=status.HTTP_200_OK)
 def delete_product(product_id: int, db: Session = Depends(get_db)):
+    """Delete product"""
+    if product_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Product ID must be > 0")
+    
     db_product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if db_product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     
     db.delete(db_product)
     db.commit()
-    return {"message": "Product deleted successfully"}
+    return {"message": f"Product with ID {product_id} successfully deleted"}
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
