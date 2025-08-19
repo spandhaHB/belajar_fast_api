@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 from datetime import datetime
+from enum import Enum
 import models
 from models import Base
 from database import engine, get_db, check_db_connection
@@ -36,7 +37,8 @@ async def root():
         "endpoints": {
             "users": "/users/",
             "categories": "/categories/",
-            "products": "/products/"
+            "products": "/products/",
+            "orders": "/orders/"
         }
     }
 
@@ -559,21 +561,484 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": f"Product with ID {product_id} successfully deleted"}
 
+# Order Status Enum
+class OrderStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Order Pydantic Models
+class OrderItemBase(BaseModel):
+    product_id: int = Field(..., gt=0, description="Product ID")
+    quantity: int = Field(..., gt=0, description="Quantity of product")
     
+    @validator('quantity')
+    def validate_quantity(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be greater than 0')
+        if v > 999:
+            raise ValueError('Quantity maximum is 999')
+        return v
+
+class OrderItemCreate(OrderItemBase):
+    pass
+
+class OrderItemUpdate(BaseModel):
+    product_id: Optional[int] = Field(None, gt=0, description="Product ID")
+    quantity: Optional[int] = Field(None, gt=0, description="Quantity of product")
+    
+    @validator('quantity')
+    def validate_quantity(cls, v):
+        if v is not None:
+            if v <= 0:
+                raise ValueError('Quantity must be greater than 0')
+            if v > 999:
+                raise ValueError('Quantity maximum is 999')
+        return v
+
+class OrderItem(OrderItemBase):
+    id: int
+    order_id: int
+    price: float
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class OrderBase(BaseModel):
+    user_id: int = Field(..., gt=0, description="User ID who placed the order")
+
+class OrderCreate(OrderBase):
+    items: List[OrderItemCreate] = Field(..., min_items=1, description="List of items in the order")
+
+class OrderUpdate(BaseModel):
+    status: OrderStatus = Field(..., description="Order status (pending, completed, cancelled)")
+
+class OrderWithUser(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    total_amount: float
+    status: OrderStatus
+    created_at: datetime
+    updated_at: datetime
+    items: List[OrderItem]
+
+    class Config:
+        from_attributes = True
+
+class Order(OrderBase):
+    id: int
+    total_amount: float
+    status: OrderStatus
+    created_at: datetime
+    updated_at: datetime
+    items: List[OrderItem]
+
+    class Config:
+        from_attributes = True
+
+# ORDER API ENDPOINTS
+@app.post("/order/", response_model=OrderWithUser, status_code=status.HTTP_201_CREATED)
+def create_order(order: OrderCreate, db: Session = Depends(get_db)):
+    """Create a new order with items"""
+    # Check if user exists
+    user = db.query(models.User).filter(models.User.id == order.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User not found"
+        )
+    
+    # Validate products and calculate total amount
+    total_amount = 0
+    order_items = []
+    
+    for item in order.items:
+        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Product with ID {item.product_id} not found"
+            )
+        
+        if product.stock < item.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient stock for product {product.name}"
+            )
+        
+        # Calculate item total and update product stock
+        item_total = product.price * item.quantity
+        total_amount += item_total
+        
+        # Create OrderItem
+        order_items.append({
+            "product_id": item.product_id,
+            "quantity": item.quantity,
+            "price": product.price
+        })
+        
+        # Update product stock
+        product.stock -= item.quantity
+    
+    try:
+        # Create order
+        db_order = models.Order(
+            user_id=order.user_id,
+            total_amount=total_amount,
+            status=OrderStatus.PENDING.value
+        )
+        db.add(db_order)
+        db.flush()  # Get order ID without committing
+        
+        # Create order items
+        for item_data in order_items:
+            db_order_item = models.OrderItem(
+                order_id=db_order.id,
+                product_id=item_data["product_id"],
+                quantity=item_data["quantity"],
+                price=item_data["price"]
+            )
+            db.add(db_order_item)
+        
+        db.commit()
+        db.refresh(db_order)
+        
+        # Convert to OrderWithUser format
+        result = {
+            "id": db_order.id,
+            "user_id": db_order.user_id,
+            "user_name": user.name,
+            "total_amount": db_order.total_amount,
+            "status": db_order.status,
+            "created_at": db_order.created_at,
+            "updated_at": db_order.updated_at,
+            "items": db_order.items
+        }
+        
+        return result
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create order"
+        )
+
+@app.get("/orders/", response_model=List[OrderWithUser])
+def read_orders(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get all orders with pagination and user information"""
+    if skip < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skip must be >= 0")
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1-1000")
+    
+    # Use left join to get orders with user information
+    orders_with_users = db.query(
+        models.Order,
+        models.User.name.label('user_name')
+    ).outerjoin(
+        models.User, models.Order.user_id == models.User.id
+    ).offset(skip).limit(limit).all()
+    
+    # Convert to OrderWithUser format
+    result = []
+    for order, user_name in orders_with_users:
+        order_dict = {
+            "id": order.id,
+            "user_id": order.user_id,
+            "user_name": user_name or "Unknown User",
+            "total_amount": order.total_amount,
+            "status": order.status,
+            "created_at": order.created_at,
+            "updated_at": order.updated_at,
+            "items": order.items
+        }
+        result.append(order_dict)
+    
+    return result
+
+@app.get("/orders/user/{user_id}", response_model=List[OrderWithUser])
+def read_user_orders(user_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    """Get orders by user ID with user information"""
+    if user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User ID must be > 0")
+    
+    # Check if user exists
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    
+    # Use left join to get orders with user information
+    orders_with_users = db.query(
+        models.Order,
+        models.User.name.label('user_name')
+    ).outerjoin(
+        models.User, models.Order.user_id == models.User.id
+    ).filter(models.Order.user_id == user_id).offset(skip).limit(limit).all()
+    
+    # Convert to OrderWithUser format
+    result = []
+    for order, user_name in orders_with_users:
+        order_dict = {
+            "id": order.id,
+            "user_id": order.user_id,
+            "user_name": user_name or "Unknown User",
+            "total_amount": order.total_amount,
+            "status": order.status,
+            "created_at": order.created_at,
+            "updated_at": order.updated_at,
+            "items": order.items
+        }
+        result.append(order_dict)
+    
+    return result
+
+@app.get("/order/{order_id}", response_model=OrderWithUser)
+def read_order(order_id: int, db: Session = Depends(get_db)):
+    """Get order by ID with user information"""
+    if order_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order ID must be > 0")
+    
+    # Use left join to get order with user information
+    order_with_user = db.query(
+        models.Order,
+        models.User.name.label('user_name')
+    ).outerjoin(
+        models.User, models.Order.user_id == models.User.id
+    ).filter(models.Order.id == order_id).first()
+    
+    if not order_with_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    order, user_name = order_with_user
+    
+    # Convert to OrderWithUser format
+    result = {
+        "id": order.id,
+        "user_id": order.user_id,
+        "user_name": user_name or "Unknown User",
+        "total_amount": order.total_amount,
+        "status": order.status,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+        "items": order.items
+    }
+    
+    return result
+
+@app.put("/order/{order_id}", response_model=OrderWithUser)
+def update_order_status(order_id: int, order_update: OrderUpdate, db: Session = Depends(get_db)):
+    """Update order status"""
+    if order_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order ID must be > 0")
+    
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # If cancelling order, restore product stock
+    if order_update.status == OrderStatus.CANCELLED and order.status != OrderStatus.CANCELLED:
+        for item in order.items:
+            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+            if product:
+                product.stock += item.quantity
+    
+    order.status = order_update.status.value
+    db.commit()
+    db.refresh(order)
+    
+    # Get user information for response
+    user = db.query(models.User).filter(models.User.id == order.user_id).first()
+    user_name = user.name if user else "Unknown User"
+    
+    # Convert to OrderWithUser format
+    result = {
+        "id": order.id,
+        "user_id": order.user_id,
+        "user_name": user_name,
+        "total_amount": order.total_amount,
+        "status": order.status,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+        "items": order.items
+    }
+    
+    return result
+
+@app.delete("/order/{order_id}", status_code=status.HTTP_200_OK)
+def delete_order(order_id: int, db: Session = Depends(get_db)):
+    """Delete order"""
+    if order_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order ID must be > 0")
+    
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # If order is not cancelled, restore product stock
+    if order.status != OrderStatus.CANCELLED:
+        for item in order.items:
+            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+            if product:
+                product.stock += item.quantity
+    
+    db.delete(order)
+    db.commit()
+    return {"message": f"Order with ID {order_id} successfully deleted"}
+
+# ORDER ITEM API ENDPOINTS
+@app.get("/order-item/{item_id}", response_model=OrderItem)
+def read_order_item(item_id: int, db: Session = Depends(get_db)):
+    """Get order item by ID"""
+    if item_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Item ID must be > 0")
+    
+    order_item = db.query(models.OrderItem).filter(models.OrderItem.id == item_id).first()
+    if not order_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order item not found")
+    return order_item
+
+@app.put("/order-item/{item_id}", response_model=OrderItem)
+def update_order_item(item_id: int, item_update: OrderItemUpdate, db: Session = Depends(get_db)):
+    """Update order item"""
+    if item_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Item ID must be > 0")
+    
+    order_item = db.query(models.OrderItem).filter(models.OrderItem.id == item_id).first()
+    if not order_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order item not found")
+    
+    # Get the order to check if it can be modified
+    order = db.query(models.Order).filter(models.Order.id == order_item.order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # Check if order can be modified (only pending orders can be modified)
+    if order.status != OrderStatus.PENDING.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify items in non-pending orders"
+        )
+    
+    try:
+        # If product_id is being updated, validate the new product
+        if item_update.product_id is not None and item_update.product_id != order_item.product_id:
+            new_product = db.query(models.Product).filter(models.Product.id == item_update.product_id).first()
+            if not new_product:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="New product not found"
+                )
+            
+            # Restore stock from old product
+            old_product = db.query(models.Product).filter(models.Product.id == order_item.product_id).first()
+            if old_product:
+                old_product.stock += order_item.quantity
+            
+            # Check stock availability for new product
+            if new_product.stock < (item_update.quantity or order_item.quantity):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Insufficient stock for new product"
+                )
+            
+            # Update product_id and price
+            order_item.product_id = item_update.product_id
+            order_item.price = new_product.price
+        
+        # If quantity is being updated, handle stock changes
+        if item_update.quantity is not None and item_update.quantity != order_item.quantity:
+            product = db.query(models.Product).filter(models.Product.id == order_item.product_id).first()
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Product not found"
+                )
+            
+            # Calculate stock difference
+            quantity_diff = item_update.quantity - order_item.quantity
+            
+            # Check if we have enough stock for the increase
+            if quantity_diff > 0 and product.stock < quantity_diff:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Insufficient stock for quantity increase"
+                )
+            
+            # Update product stock
+            product.stock -= quantity_diff
+            order_item.quantity = item_update.quantity
+        
+        # Recalculate order total
+        order_items = db.query(models.OrderItem).filter(models.OrderItem.order_id == order.id).all()
+        new_total = sum(item.price * item.quantity for item in order_items)
+        order.total_amount = new_total
+        
+        db.commit()
+        db.refresh(order_item)
+        return order_item
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update order item"
+        )
+
+@app.delete("/order-item/{item_id}", status_code=status.HTTP_200_OK)
+def delete_order_item(item_id: int, db: Session = Depends(get_db)):
+    """Delete order item"""
+    if item_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Item ID must be > 0")
+    
+    order_item = db.query(models.OrderItem).filter(models.OrderItem.id == item_id).first()
+    if not order_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order item not found")
+    
+    # Get the order to check if it can be modified
+    order = db.query(models.Order).filter(models.Order.id == order_item.order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # Check if order can be modified (only pending orders can be modified)
+    if order.status != OrderStatus.PENDING.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete items in non-pending orders"
+        )
+    
+    try:
+        # Restore product stock
+        product = db.query(models.Product).filter(models.Product.id == order_item.product_id).first()
+        if product:
+            product.stock += order_item.quantity
+        
+        # Recalculate order total
+        remaining_items = db.query(models.OrderItem).filter(
+            models.OrderItem.order_id == order.id,
+            models.OrderItem.id != item_id
+        ).all()
+        
+        if remaining_items:
+            new_total = sum(item.price * item.quantity for item in remaining_items)
+            order.total_amount = new_total
+        else:
+            # If no items left, delete the entire order
+            db.delete(order)
+            db.commit()
+            return {"message": f"Order item with ID {item_id} deleted. Order was empty and has been deleted."}
+        
+        # Delete the order item
+        db.delete(order_item)
+        db.commit()
+        return {"message": f"Order item with ID {item_id} successfully deleted"}
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete order item"
+        )
